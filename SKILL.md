@@ -1,13 +1,11 @@
+---
+name: bagman
+description: "Secure key management for AI agents handling wallets, private keys, and secrets. Covers 1Password integration, output sanitization, input validation against prompt injection, ERC-4337 session keys, operation allowlisting, and pre-commit secret detection. Use when an agent needs wallet or blockchain access, when handling API keys or credentials, when building systems where AI controls funds, or when preventing secret leakage via prompts or outputs."
+---
+
 # Bagman
 
 Secure key management patterns for AI agents handling wallets, private keys, and secrets.
-
-## When to Use This Skill
-
-- Agent needs wallet/blockchain access
-- Handling API keys, credentials, or secrets
-- Building systems where AI controls funds
-- Preventing secret leakage via prompts or outputs
 
 ## Quick Start
 
@@ -42,23 +40,11 @@ cd examples && python test_suite.py
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                   AI Agent                          │
-├─────────────────────────────────────────────────────┤
-│  Session Key (bounded)                              │
-│  ├─ Expires after N hours                           │
-│  ├─ Max spend per tx/day                            │
-│  └─ Whitelist of allowed contracts/methods          │
-├─────────────────────────────────────────────────────┤
-│  Secret Manager (1Password/Vault)                   │
-│  ├─ Retrieve at runtime only                        │
-│  ├─ Never persist to disk                           │
-│  └─ Audit trail of accesses                         │
-├─────────────────────────────────────────────────────┤
-│  Smart Account (ERC-4337)                           │
-│  ├─ Programmable permissions                        │
-│  └─ Recovery without key exposure                   │
-└─────────────────────────────────────────────────────┘
+AI Agent
+├── Session Key (bounded: expiry, spend cap, contract whitelist)
+├── Secret Manager (1Password / Vault / AWS Secrets Manager)
+│   └── Retrieve at runtime only, never persist to disk
+└── Smart Account (ERC-4337: programmable permissions, safe recovery)
 ```
 
 ---
@@ -157,16 +143,7 @@ def respond(content: str) -> str:
 # - JWT tokens
 ```
 
-### Patterns Detected
-
-| Pattern | Example | Result |
-|---------|---------|--------|
-| ETH private key | `0x1234...abcd` (64 hex) | `[PRIVATE_KEY_REDACTED]` |
-| ETH address | `0x742d...f44e` (40 hex) | `0x742d...f44e` (truncated) |
-| OpenAI key | `sk-proj-abc123...` | `[OPENAI_KEY_REDACTED]` |
-| Anthropic key | `sk-ant-api03-...` | `[ANTHROPIC_KEY_REDACTED]` |
-| 12-word seed | `abandon ability able...` | `[SEED_PHRASE_12_WORDS_REDACTED]` |
-| JWT | `eyJhbG...` | `[JWT_TOKEN_REDACTED]` |
+Detected patterns: ETH private keys, OpenAI/Anthropic/Groq/AWS keys, GitHub/Slack/Discord tokens, BIP-39 seed phrases, PEM private keys, JWTs.
 
 ---
 
@@ -212,56 +189,18 @@ Never execute arbitrary operations. Explicit whitelist only.
 **Autonomous-first design:** Agents should operate within bounds without asking for approval on every transaction. Use on-chain delegation caveats as the primary protection, software limits as backup.
 
 ```python
-from dataclasses import dataclass
-from decimal import Decimal
-from typing import Optional
-
-@dataclass
-class AllowedOperation:
-    name: str
-    handler: callable
-    max_value: Optional[Decimal] = None
-    requires_confirmation: bool = False  # Default: autonomous
-    cooldown_seconds: int = 0
-
-# Autonomous operations (no confirmation needed - delegation caveats enforce limits)
 ALLOWED_OPS = {
     "check_balance": AllowedOperation("check_balance", get_balance),
     "transfer_usdc": AllowedOperation(
-        "transfer_usdc", 
-        transfer,
-        max_value=Decimal("500"),      # Software limit (backup)
-        requires_confirmation=False,    # On-chain caveats are primary protection
-        cooldown_seconds=0
-    ),
-    "swap": AllowedOperation(
-        "swap",
-        swap_tokens,
-        max_value=Decimal("1000"),
+        "transfer_usdc", transfer,
+        max_value=Decimal("500"),
         requires_confirmation=False,
-        cooldown_seconds=0
     ),
-    # Only require confirmation for exceptional cases
     "emergency_withdraw": AllowedOperation(
-        "emergency_withdraw",
-        emergency_withdraw,
-        requires_confirmation=True,     # Human-in-the-loop for emergencies
+        "emergency_withdraw", emergency_withdraw,
+        requires_confirmation=True,
     ),
 }
-
-def execute(op_name: str, **kwargs):
-    if op_name not in ALLOWED_OPS:
-        raise PermissionError(f"Operation '{op_name}' not allowed")
-    
-    op = ALLOWED_OPS[op_name]
-    
-    if op.max_value and kwargs.get("amount", 0) > op.max_value:
-        raise PermissionError(f"Amount exceeds limit: {op.max_value}")
-    
-    if op.requires_confirmation:
-        return request_confirmation(op_name, kwargs)
-    
-    return op.handler(**kwargs)
 ```
 
 ### When to Use Each Protection Layer
@@ -276,40 +215,7 @@ def execute(op_name: str, **kwargs):
 
 ## 5. Confirmation Flow (Opt-In)
 
-**Most agents should NOT use this for normal operations.** Delegation caveats provide on-chain protection without friction.
-
-Use confirmation codes only for exceptional cases where human oversight is required:
-
-```python
-import hashlib
-import time
-
-pending_confirmations = {}
-
-def request_confirmation(operation: str, details: dict) -> str:
-    code = hashlib.sha256(
-        f"{operation}{time.time()}".encode()
-    ).hexdigest()[:8].upper()
-    
-    pending_confirmations[code] = {
-        "op": operation,
-        "details": details,
-        "expires": time.time() + 300  # 5 minutes
-    }
-    
-    return f"⚠️ Confirm '{operation}' with code: {code}\n(expires in 5 minutes)"
-
-def confirm(code: str):
-    if code not in pending_confirmations:
-        return "Invalid confirmation code"
-    
-    req = pending_confirmations.pop(code)
-    
-    if time.time() > req["expires"]:
-        return "Confirmation code expired"
-    
-    return execute_confirmed(req["op"], req["details"])
-```
+**Most agents should NOT use this for normal operations.** Delegation caveats provide on-chain protection without friction. Use confirmation codes only for exceptional cases where human oversight is required — see `examples/session_keys.py` for the implementation.
 
 ---
 
@@ -375,74 +281,18 @@ Detected patterns:
 ## 8. Defense Layers
 
 ```
-USER INPUT
-    │
-    ▼
-┌────────────────────────────┐
-│ Layer 1: Input Validation  │  ← Regex + encoding + unicode checks
-└────────────────────────────┘
-    │
-    ▼
-┌────────────────────────────┐
-│ Layer 2: Op Allowlisting   │  ← Explicit whitelist only
-└────────────────────────────┘
-    │
-    ▼
-┌────────────────────────────┐
-│ Layer 3: Value Limits      │  ← Max per-tx and per-day
-└────────────────────────────┘
-    │
-    ▼
-┌────────────────────────────┐
-│ Layer 4: Confirmation      │  ← Time-limited codes for $$$
-└────────────────────────────┘
-    │
-    ▼
-┌────────────────────────────┐
-│ Layer 5: Isolated Exec     │  ← Wallet ops != conversation
-└────────────────────────────┘
-    │
-    ▼
-OUTPUT SANITIZATION
+Input → Validation → Op Allowlist → Value Limits → Confirmation → Isolated Exec → Output Sanitization
 ```
 
 ---
 
 ## Common Mistakes
 
-### ❌ Keys in memory files
-```markdown
-# memory/2026-02-07.md
-Private key: 0x9f01dad551039daad...
-```
-**Fix:** Store reference only: `Private key: [stored in 1Password: test-wallet]`
-
-### ❌ Keys in error messages
-```python
-except Exception as e:
-    log(f"Failed with key {private_key}: {e}")
-```
-**Fix:** Never include credentials in error context
-
-### ❌ Keys in .env.example
-```
-PRIVATE_KEY=sk-ant-api03-real-key...  # "for testing"
-```
-**Fix:** Use obviously fake: `PRIVATE_KEY=your-key-here`
-
-### ❌ "All" in transfer requests
-```
-User: "Transfer all my USDC"
-Agent: *executes unlimited transfer*
-```
-**Fix:** Block "all/everything/max" patterns, require explicit amounts
-
-### ❌ Trusting conversation context
-```python
-# Wallet has access to conversation history
-self.wallet.execute(conversation[-1]["content"])
-```
-**Fix:** Wallet operations must be isolated from conversation context
+- **Keys in memory files** — store references only: `[stored in 1Password: test-wallet]`
+- **Keys in error messages** — never include credentials in error context
+- **Keys in .env.example** — use obviously fake values: `PRIVATE_KEY=your-key-here`
+- **"Transfer all" requests** — block "all/everything/max" patterns, require explicit amounts
+- **Trusting conversation context** — wallet operations must be isolated from conversation
 
 ---
 
@@ -481,15 +331,4 @@ Expected output: `All tests passed`
 
 ## Security Model Limitations
 
-This skill provides **defense in depth**, not a guarantee. Adversaries may:
-
-1. **Novel injection patterns** - Regex can't catch everything; semantic analysis helps but isn't perfect
-2. **Social engineering** - Convincing the operator to approve malicious operations
-3. **Timing attacks** - Exploiting confirmation windows
-4. **Encoding evasion** - New encoding schemes not covered
-
-**Recommendation:** Layer these defenses with:
-- Rate limiting
-- Anomaly detection
-- Human-in-the-loop for large transactions
-- Regular security audits
+This skill provides **defense in depth**, not a guarantee. Layer these defenses with rate limiting, anomaly detection, human-in-the-loop for large transactions, and regular security audits.
